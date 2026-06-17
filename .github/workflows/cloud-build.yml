@@ -68,19 +68,26 @@ jobs:
       - name: Collect APKs
         id: collect
         run: |
-          build_dir="app/build/outputs/apk/${{ inputs.build_type }}"
-          suffix="${{ inputs.build_type == 'release' && '' || '-debug' }}"
+          BUILD_TYPE="${{ inputs.build_type }}"
+          if [ "$BUILD_TYPE" = "release" ]; then
+            suffix=""
+          else
+            suffix="-debug"
+          fi
+          build_dir="app/build/outputs/apk/${BUILD_TYPE}"
           staging_dir="/tmp/apks"
           mkdir -p "$staging_dir"
 
           for arch in universal arm64-v8a armeabi-v7a x86 x86_64; do
-            apk=$(find "$build_dir" -name "*-${arch}-*${suffix}.apk" 2>/dev/null | head -n 1)
+            apk=$(find "$build_dir" -maxdepth 1 -name "*-${arch}-*${suffix}.apk" 2>/dev/null | head -n 1)
             if [[ -n "$apk" ]]; then
               cp "$apk" "$staging_dir/"
             fi
           done
 
-          apk_count=$(find "$staging_dir" -name "*.apk" | wc -l)
+          echo "Found APKs:"
+          ls -la "$staging_dir"/
+          apk_count=$(find "$staging_dir" -maxdepth 1 -name "*.apk" | wc -l)
           echo "apk_count=$apk_count" >> "$GITHUB_OUTPUT"
           echo "staging_dir=$staging_dir" >> "$GITHUB_OUTPUT"
 
@@ -88,7 +95,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Sesame-TK-${{ inputs.build_type }}-apks
-          path: ${{ steps.collect.outputs.staging_dir }}/*.apk
+          path: ${{ steps.collect.outputs.staging_dir }}
           if-no-files-found: error
 
       - name: Create GitHub Release
