@@ -3,8 +3,15 @@ run-name: Auto Build Upstream - ${{ github.actor || 'schedule' }}
 
 on:
   schedule:
+    # 每天 UTC 00:00 查询上游 tag
     - cron: "0 0 * * *"
   workflow_dispatch:
+    inputs:
+      force_tag:
+        description: "强制构建指定上游 tag（留空则使用最新 tag）"
+        required: false
+        type: string
+        default: ""
 
 env:
   UPSTREAM_REPO: Sesame-AG/Sesame-AG
@@ -24,31 +31,95 @@ jobs:
     outputs:
       latest_tag: ${{ steps.fetch.outputs.latest_tag }}
       latest_commit: ${{ steps.fetch.outputs.latest_commit }}
+      previous_tag: ${{ steps.fetch.outputs.previous_tag }}
       should_build: ${{ steps.check.outputs.should_build }}
+      build_tag: ${{ steps.check.outputs.build_tag }}
     steps:
-      - name: Fetch latest upstream tag
+      - name: Fetch upstream tags
         id: fetch
         env:
           GH_TOKEN: ${{ github.token }}
+          FORCE_TAG: ${{ inputs.force_tag }}
         run: |
           set -euo pipefail
-          api_url="https://api.github.com/repos/${UPSTREAM_REPO}/tags?per_page=1&page=1"
+
+          api_url="https://api.github.com/repos/${UPSTREAM_REPO}/tags?per_page=30&page=1"
           response=$(curl -fsSL \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "$api_url")
-          latest_tag=$(echo "$response" | python3 -c "import json,sys; data=json.load(sys.stdin); print(data[0]['name'] if data else '')")
-          latest_commit=$(echo "$response" | python3 -c "import json,sys; data=json.load(sys.stdin); print(data[0]['commit']['sha'] if data else '')")
+
+          mapfile -t tags < <(echo "$response" | python3 -c '
+import json,sys
+data=json.load(sys.stdin)
+for item in data:
+    name=(item.get("name") or "").strip()
+    if name:
+        print(name)
+')
+
+          if [[ ${#tags[@]} -eq 0 ]]; then
+            echo "Failed to resolve upstream tags from ${UPSTREAM_REPO}" >&2
+            exit 1
+          fi
+
+          force_tag="${FORCE_TAG//[[:space:]]/}"
+          latest_tag=""
+          previous_tag=""
+
+          if [[ -n "$force_tag" ]]; then
+            latest_tag="$force_tag"
+            for tag in "${tags[@]}"; do
+              if [[ "$tag" != "$force_tag" ]]; then
+                previous_tag="$tag"
+                break
+              fi
+            done
+          else
+            latest_tag="${tags[0]}"
+            if [[ ${#tags[@]} -gt 1 ]]; then
+              previous_tag="${tags[1]}"
+            fi
+          fi
+
+          commit_api="https://api.github.com/repos/${UPSTREAM_REPO}/git/ref/tags/${latest_tag}"
+          commit_json=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$commit_api")
+
+          latest_commit=$(echo "$commit_json" | python3 -c '
+import json,sys
+data=json.load(sys.stdin)
+obj=data.get("object") or {}
+sha=obj.get("sha") or ""
+# annotated tags point to a tag object; resolve peels via commit field if present
+print(sha)
+')
+
+          # If ref points to annotated tag object, resolve to commit sha
+          obj_type=$(echo "$commit_json" | python3 -c 'import json,sys; print((json.load(sys.stdin).get("object") or {}).get("type") or "")')
+          if [[ "$obj_type" == "tag" ]]; then
+            tag_obj_api="https://api.github.com/repos/${UPSTREAM_REPO}/git/tags/${latest_commit}"
+            tag_obj_json=$(curl -fsSL \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "$tag_obj_api")
+            latest_commit=$(echo "$tag_obj_json" | python3 -c 'import json,sys; print(((json.load(sys.stdin).get("object") or {}).get("sha") or ""))')
+          fi
 
           if [[ -z "$latest_tag" || -z "$latest_commit" ]]; then
-            echo "Failed to resolve latest upstream tag from ${UPSTREAM_REPO}" >&2
+            echo "Failed to resolve latest upstream tag/commit from ${UPSTREAM_REPO}" >&2
             exit 1
           fi
 
           echo "latest_tag=$latest_tag" >> "$GITHUB_OUTPUT"
           echo "latest_commit=$latest_commit" >> "$GITHUB_OUTPUT"
-          echo "Latest upstream tag: $latest_tag ($latest_commit)"
+          echo "previous_tag=$previous_tag" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream tag: $latest_tag ($latest_commit), previous: ${previous_tag:-none}"
 
       - name: Check if already built
         id: check
@@ -58,6 +129,8 @@ jobs:
           set -euo pipefail
           tag="${{ steps.fetch.outputs.latest_tag }}"
           build_tag="${tag}-build"
+          echo "build_tag=$build_tag" >> "$GITHUB_OUTPUT"
+
           if gh release view "$build_tag" --repo "${{ github.repository }}" &>/dev/null; then
             echo "Release $build_tag already exists, skipping"
             echo "should_build=false" >> "$GITHUB_OUTPUT"
@@ -148,6 +221,196 @@ jobs:
           echo "count=$count" >> "$GITHUB_OUTPUT"
           echo "staging_dir=$staging_dir" >> "$GITHUB_OUTPUT"
 
+      - name: Generate release notes
+        id: notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LATEST_TAG: ${{ needs.check.outputs.latest_tag }}
+          LATEST_COMMIT: ${{ needs.check.outputs.latest_commit }}
+          PREVIOUS_TAG: ${{ needs.check.outputs.previous_tag }}
+        run: |
+          set -euo pipefail
+          notes_path="${RUNNER_TEMP}/release-notes.md"
+          short_commit="${LATEST_COMMIT:0:7}"
+
+          python3 - <<'PY' > "$notes_path"
+          import json
+          import os
+          import re
+          import subprocess
+          import urllib.error
+          import urllib.request
+
+          upstream = os.environ["UPSTREAM_REPO"]
+          token = os.environ["GH_TOKEN"]
+          latest_tag = os.environ["LATEST_TAG"]
+          latest_commit = os.environ["LATEST_COMMIT"]
+          previous_tag = (os.environ.get("PREVIOUS_TAG") or "").strip()
+          short_commit = latest_commit[:7]
+
+          headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {token}",
+              "X-GitHub-Api-Version": "2022-11-28",
+              "User-Agent": "auto-upstream-build",
+          }
+
+
+          def api_get(url: str):
+              req = urllib.request.Request(url, headers=headers)
+              try:
+                  with urllib.request.urlopen(req, timeout=60) as resp:
+                      return json.load(resp)
+              except urllib.error.HTTPError as exc:
+                  body = exc.read().decode("utf-8", errors="replace")
+                  raise RuntimeError(f"GET {url} failed: HTTP {exc.code}: {body[:300]}") from exc
+
+
+          def first_line(text: str) -> str:
+              return (text or "").strip().splitlines()[0].strip() if text else ""
+
+
+          # 1) Prefer official GitHub Release body if upstream published one.
+          release_body = ""
+          try:
+              release = api_get(f"https://api.github.com/repos/{upstream}/releases/tags/{latest_tag}")
+              release_body = (release.get("body") or "").strip()
+          except Exception:
+              release_body = ""
+
+          # 2) Annotated tag message.
+          tag_message = ""
+          try:
+              ref = api_get(f"https://api.github.com/repos/{upstream}/git/ref/tags/{latest_tag}")
+              obj = ref.get("object") or {}
+              if obj.get("type") == "tag":
+                  tag_obj = api_get(f"https://api.github.com/repos/{upstream}/git/tags/{obj.get('sha')}")
+                  tag_message = (tag_obj.get("message") or "").strip()
+          except Exception:
+              tag_message = ""
+
+          # 3) Commit range between previous tag and current tag.
+          commits = []
+          compare_url = ""
+          if previous_tag:
+              compare_url = f"https://github.com/{upstream}/compare/{previous_tag}...{latest_tag}"
+              try:
+                  compare = api_get(
+                      f"https://api.github.com/repos/{upstream}/compare/{previous_tag}...{latest_tag}"
+                  )
+                  commits = compare.get("commits") or []
+              except Exception:
+                  commits = []
+
+          if not commits:
+              # Fallback: recent commits on the tag tip.
+              try:
+                  commits = api_get(
+                      f"https://api.github.com/repos/{upstream}/commits?sha={latest_commit}&per_page=30"
+                  )
+              except Exception:
+                  commits = []
+
+          categories = [
+              ("feat", "新功能"),
+              ("fix", "问题修复"),
+              ("perf", "性能优化"),
+              ("refactor", "重构调整"),
+              ("docs", "文档"),
+              ("chore", "杂项"),
+              ("ci", "CI"),
+              ("other", "其他更新"),
+          ]
+          buckets = {key: [] for key, _ in categories}
+          type_re = re.compile(r"^(?P<type>[A-Za-z]+)(?:\([^)]*\))?!?:\s+")
+
+          for item in commits:
+              sha = item.get("sha") or ""
+              message = ((item.get("commit") or {}).get("message") or "").strip()
+              subject = first_line(message)
+              if not subject:
+                  continue
+              # Skip pure merge noise.
+              if subject.lower().startswith("merge "):
+                  continue
+              m = type_re.match(subject)
+              category = "other"
+              if m:
+                  t = m.group("type").lower()
+                  if t in buckets:
+                      category = t
+                  elif t in {"build", "style", "test"}:
+                      category = "chore"
+              buckets[category].append((subject, sha[:7], sha))
+
+          lines = []
+          lines.append(f"## Sesame-TK {latest_tag} 自动构建")
+          lines.append("")
+          lines.append(
+              f"基于上游 [{upstream}](https://github.com/{upstream}) tag `{latest_tag}` "
+              f"(commit `{short_commit}`) 自动构建。"
+          )
+          lines.append("")
+          lines.append(f"- 上游标签：[`{latest_tag}`](https://github.com/{upstream}/releases/tag/{latest_tag})")
+          lines.append(f"- 上游提交：[`{short_commit}`](https://github.com/{upstream}/commit/{latest_commit})")
+          if previous_tag:
+              lines.append(f"- 对比范围：`{previous_tag}...{latest_tag}`")
+              if compare_url:
+                  lines.append(f"- 完整对比：{compare_url}")
+          lines.append("")
+
+          if release_body:
+              lines.append("## 上游发布说明")
+              lines.append("")
+              lines.append(release_body)
+              lines.append("")
+          elif tag_message and tag_message not in {latest_tag, latest_tag.split("-")[-1]}:
+              lines.append("## 上游标签说明")
+              lines.append("")
+              lines.append(tag_message)
+              lines.append("")
+
+          has_changes = any(buckets[key] for key, _ in categories)
+          if has_changes:
+              lines.append("## 更新说明")
+              lines.append("")
+              for key, title in categories:
+                  items = buckets[key]
+                  if not items:
+                      continue
+                  lines.append(f"### {title}")
+                  lines.append("")
+                  for subject, short_sha, full_sha in items:
+                      lines.append(
+                          f"- {subject} "
+                          f"([{short_sha}](https://github.com/{upstream}/commit/{full_sha}))"
+                      )
+                  lines.append("")
+          else:
+              lines.append("## 更新说明")
+              lines.append("")
+              lines.append("_暂未解析到可展示的提交变更，请查看上游仓库提交历史。_")
+              lines.append("")
+
+          lines.append("## 下载说明")
+          lines.append("")
+          lines.append("- `app-arm64-v8a-release.apk`：64 位 ARM 设备（主流手机）")
+          lines.append("- `app-armeabi-v7a-release.apk`：32 位 ARM 设备（旧款手机）")
+          lines.append("- `app-x86_64-release.apk` / `app-x86-release.apk`：模拟器")
+          lines.append("- `app-universal-release.apk`：通用版（不确定架构时使用）")
+          lines.append("")
+          lines.append(
+              f"> 此为自动构建版本，非官方发布。使用前请阅读 "
+              f"[LEGAL.md](https://github.com/{upstream}/blob/main/LEGAL.md)。"
+          )
+
+          print("\n".join(lines))
+          PY
+
+          echo "notes_path=$notes_path" >> "$GITHUB_OUTPUT"
+          echo "----- Release notes preview -----"
+          head -n 80 "$notes_path" || true
+
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -161,10 +424,9 @@ jobs:
         run: |
           set -euo pipefail
           tag="${{ needs.check.outputs.latest_tag }}"
-          commit="${{ needs.check.outputs.latest_commit }}"
-          short_commit="${commit:0:7}"
-          build_tag="${tag}-build"
+          build_tag="${{ needs.check.outputs.build_tag }}"
           default_branch="${{ github.event.repository.default_branch }}"
+          notes_path="${{ steps.notes.outputs.notes_path }}"
 
           shopt -s nullglob
           apk_files=(${{ steps.collect.outputs.staging_dir }}/*.apk)
@@ -173,20 +435,15 @@ jobs:
             exit 1
           fi
 
+          if [[ ! -f "$notes_path" ]]; then
+            echo "Release notes file missing: $notes_path" >&2
+            exit 1
+          fi
+
           gh release create "$build_tag" \
             "${apk_files[@]}" \
             --repo "${{ github.repository }}" \
             --target "$default_branch" \
             --title "Sesame-TK ${tag} (自动构建)" \
-            --notes "## Sesame-TK ${tag} 自动构建
-
-          基于上游 [${UPSTREAM_REPO}](https://github.com/${UPSTREAM_REPO}) tag \`${tag}\` (commit \`${short_commit}\`) 自动构建。
-
-          **架构说明**：
-          - \`*-arm64-v8a-*.apk\` - 64位 ARM 设备
-          - \`*-armeabi-v7a-*.apk\` - 32位 ARM 设备
-          - \`*-x86_64-*.apk\` - 64位 x86（模拟器）
-          - \`*-x86-*.apk\` - 32位 x86（模拟器）
-          - \`*-universal-*.apk\` / 其他 - 通用版
-
-          **注意**：此为自动构建版本，非官方发布。使用前请阅读 [LEGAL.md](https://github.com/${UPSTREAM_REPO}/blob/main/LEGAL.md)。"
+            --notes-file "$notes_path" \
+            --latest
